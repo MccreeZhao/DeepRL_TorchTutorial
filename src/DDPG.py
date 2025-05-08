@@ -351,7 +351,7 @@ current_time = time.strftime("%Y%m%d_%H%M%S")
 video_name = f"pendulum_DDPG_{current_time}"
 video_env = RecordVideo(
     video_env, 
-    video_folder="videos",
+    video_folder=save_dir,
     name_prefix=video_name,
     episode_trigger=lambda episode_id: True
 )
