@@ -57,52 +57,37 @@ class ReplayMemory(object):
         self.memory.clear()
 
 
-# 3. Establish the Dueling DQN model
-# class ActorCritic(nn.Module):
-#     def __init__(self, n_observations, n_actions):
-#         super(ActorCritic, self).__init__()
-
-#         # Shared layers
-#         self.layer1 = nn.Linear(n_observations, 128)
-#         self.layer2 = nn.Linear(128, 128)
-
-#         # Prob stream (P(a|s))
-#         self.prob_stream = nn.Linear(128, n_actions)
-#         self.softmax = nn.Softmax(dim=1)
-
-#     def forward(self, x):
-#         x = F.relu(self.layer1(x))
-#         x = F.relu(self.layer2(x))
-
-#         return self.softmax(self.prob_stream(x))
-
-
-# class Value_Net(nn.Module):
-#     def __init__(self, n_observations):
-#         super(Value_Net, self).__init__()
-#         self.layer1 = nn.Linear(n_observations, 128)
-#         self.layer2 = nn.Linear(128, 128)
-#         self.value_stream = nn.Linear(128, 1)
-
-#     def forward(self, x):
-#         x = F.relu(self.layer1(x))
-#         x = F.relu(self.layer2(x))
-#         return self.value_stream(x)
-
-
-class ActorCritic(nn.Module):
-    """共享两层 MLP 的 Actor‑Critic 网络。"""
-
+class Actor(nn.Module):
+    """Actor网络，用于生成动作概率分布"""
     def __init__(self, num_obs: int, num_actions: int):
         super().__init__()
-        self.shared = nn.Sequential(nn.Linear(num_obs, 128), nn.ReLU(), nn.Linear(128, 128), nn.ReLU())
-        self.policy_head = nn.Linear(128, num_actions)
-        self.value_head = nn.Linear(128, 1)
+        self.net = nn.Sequential(
+            nn.Linear(num_obs, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_actions)
+        )
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x):
-        x = self.shared(x)
-        return self.softmax(self.policy_head(x)), self.value_head(x)
+        return self.softmax(self.net(x))
+
+
+class Critic(nn.Module):
+    """Critic网络，用于评估状态价值"""
+    def __init__(self, num_obs: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(num_obs, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
 # 4. Training Hyperparameters and Helper Functions
@@ -119,7 +104,9 @@ GAMMA = 0.99
 # EPS_END = 0.05
 # EPS_DECAY = 1000
 # TAU = 0.005
-LR = 3e-4
+# LR = 3e-4
+critic_lr = 1e-3
+actor_lr = 1e-5
 
 # Get number of actions from gym action space
 n_actions = env.action_space.n
@@ -127,10 +114,13 @@ n_actions = env.action_space.n
 state, info = env.reset()
 n_observations = len(state)
 
-# policy_net = ActorCritic(n_observations, n_actions).to(device)
-# value_net = Value_Net(n_observations).to(device)
-actor_critic = ActorCritic(n_observations, n_actions).to(device)
-optimizer = optim.AdamW(actor_critic.parameters(), lr=LR, amsgrad=True, weight_decay=2e-5)
+# actor = Actor(n_observations, n_actions).to(device)
+# critic = Critic(n_observations).to(device)
+actor = Actor(n_observations, n_actions).to(device)
+critic = Critic(n_observations).to(device)
+# optimizer = optim.AdamW(list(actor.parameters()) + list(critic.parameters()), lr=LR, amsgrad=True)
+critic_optimizer = optim.AdamW(critic.parameters(), lr=critic_lr, amsgrad=True)
+actor_optimizer = optim.AdamW(actor.parameters(), lr=actor_lr, amsgrad=True)
 memory = ReplayMemory(1000)
 memory.clear()
 steps_done = 0
@@ -138,20 +128,8 @@ steps_done = 0
 
 def select_action(state):
     global steps_done
-    # sample = random.random()
-    # eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1.0 * steps_done / EPS_DECAY)
     steps_done += 1
-    # if sample > eps_threshold:
-    #     with torch.no_grad():
-    #         # t.max(1) will return the largest column value of each row.
-    #         # second column on max result is index of where max element was
-    #         # found, so we pick action with the larger expected reward.
-    #         return policy_net(state).max(1).indices.view(1, 1)
-    # else:
-    #     return torch.tensor([[env.action_space.sample()]], device=device, dtype=torch.long)
-    prob, _ = actor_critic(state)
-    # log_prob = torch.log(prob)
-    # action = torch.multinomial(prob, num_samples=1)
+    prob = actor(state)
     dist = torch.distributions.Categorical(probs=prob)
     entropy = dist.entropy()
     action = dist.sample()
@@ -191,7 +169,7 @@ def plot_durations(show_result=False):
 
 
 # 5. Training Function
-def optimize_model():
+def optimize_model(i_episode):
 
     accumulated_reward = []
     log_probs = []
@@ -201,8 +179,9 @@ def optimize_model():
     rewards = []
     entropies = []
     reward_sum = 0
+    # if len(memory) < BATCH_SIZE:
+    #     return None
     while len(memory) > 0:
-        # item = memory.popleft()
         item = memory.popright()
         reward_sum = reward_sum * GAMMA + item.reward
         accumulated_reward.insert(0, reward_sum)
@@ -215,48 +194,50 @@ def optimize_model():
     # accumulated_reward = (accumulated_reward - accumulated_reward.mean()) / (accumulated_reward.std() + 1e-5)
 
     # 计算 value loss
+    
     cur_state = torch.stack(cur_state, dim=0).to(device).squeeze(1)
-    next_state = torch.stack(next_state[0:-1], dim=0).to(device).squeeze(1)
-    _, V_current = actor_critic(cur_state)
-    _, V_next = actor_critic(next_state)
-    # V_next = value_net(next_state)
-    V_reward = torch.stack(rewards, dim=0).to(device).squeeze(1)[0:-1]
+    next_state = torch.stack(next_state, dim=0).to(device).squeeze(1)
+    not_terminate_mask = next_state.sum(dim=1) != 0
+    
+    V_current = critic(cur_state)
+    V_next = critic(next_state).detach()
+    V_reward = torch.stack(rewards, dim=0).to(device).squeeze(1)
 
-    # value_loss = torch.nn.functional.mse_loss(V_current.squeeze(1), V_reward + GAMMA * V_next.squeeze(1))
-    value_loss = torch.nn.functional.mse_loss(V_current.squeeze(1)[0:-1], V_reward + GAMMA * V_next.squeeze(1))
+    # value_loss1 = torch.nn.functional.mse_loss(V_current.squeeze(1)* not_terminate_mask, V_reward* not_terminate_mask + GAMMA * V_next.squeeze(1).detach() * not_terminate_mask)
+    value_loss = torch.nn.functional.mse_loss(V_current.squeeze(1), V_reward + GAMMA * V_next.squeeze(1) * not_terminate_mask)
+    # value_loss = value_loss1
+    # if value_loss1.item()>100:
+    #     print(1)
 
     # 计算 advantage loss (修改原始的policy loss)
-    advantages = V_reward + GAMMA * V_next.detach().squeeze(1) - V_current[0:-1].detach().squeeze(1)
+    advantages = (V_reward + GAMMA * V_next.squeeze(1) - V_current.squeeze(1)).detach() * not_terminate_mask
     # advantages = V_reward + GAMMA * V_next.detach() - V_current.detach()
     # 这个detach很关键，防止梯度传到policy net, 确保policy和value net的独立性
     # normalized_reward = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
     normalized_reward = advantages  # 实际用下来，不做normalize好像收敛更稳定
 
     log_probs = torch.stack(log_probs).squeeze(1)
-    loss = (log_probs[0:-1] * normalized_reward).sum()
-    # print(f"loss.max(): {loss.max()}, loss.min(): {loss.min()}")
-    loss = -loss / len(log_probs)
-
-    # entropy_loss = torch.distributions.Categorical(logits=log_probs).entropy()
+    policy_loss = -(log_probs * normalized_reward).sum() / len(log_probs)
+    # if i_episode < 50:
+    #     policy_loss = policy_loss * 0
     entropy_loss = torch.stack(entropies).sum()
+    
 
-    loss = loss + 1 * value_loss  # + 0.00001 * entropy_loss
+    total_loss = policy_loss + 0.5 * value_loss - 0.001 * entropy_loss
+    print(f"policy_loss: {policy_loss.item()}, value_loss: {value_loss.item()}, entropy_loss: {entropy_loss.item()}, total_loss: {total_loss.item()}")
+    
+    critic_optimizer.zero_grad()
+    actor_optimizer.zero_grad()
+    total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), 1)
+    critic_optimizer.step()
+    actor_optimizer.step()
 
-    print(f"loss: {loss.item()}, value_loss: {value_loss.item()}, entropy_loss: {entropy_loss.item()}")
-
-    # Optimize the model
-    optimizer.zero_grad()
-    loss.backward()
-    # In-place gradient clipping
-    # torch.nn.utils.clip_grad_value_(actor_critic.parameters(), 1)
-    torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), 0.2)
-    optimizer.step()
-
-    return loss.item()
+    return total_loss.item()
 
 
 if torch.cuda.is_available() or torch.backends.mps.is_available():
-    num_episodes = 600
+    num_episodes = 3000
 else:
     num_episodes = 50
 
@@ -277,7 +258,8 @@ for i_episode in tqdm(range(num_episodes)):
         done = terminated or truncated
 
         if terminated:
-            next_state = None
+            next_state = state*0
+            reward = torch.tensor([-5], device=device)
         else:
             next_state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
 
@@ -288,21 +270,23 @@ for i_episode in tqdm(range(num_episodes)):
         state = next_state
 
         if done:
-            loss_val = optimize_model()
-            if loss_val is not None:
-                episode_loss_values.append(loss_val)
+        # if done or len(memory) > 5:
+            loss_val = optimize_model(i_episode)
+            if done:
+                if loss_val is not None:
+                    episode_loss_values.append(loss_val)
 
-            episode_durations.append(t + 1)
-            # 如果当前 episode 有记录 loss，则计算平均 loss，否则记录为 None
-            if episode_loss_values:
-                avg_loss = sum(episode_loss_values) / len(episode_loss_values)
-            else:
-                avg_loss = None
-            episode_losses.append(avg_loss)
-            # 输出日志信息：episode编号、持续时间以及平均loss
-            print(f"Episode {i_episode + 1}: Duration = {t + 1}, Average Loss = {avg_loss}")
-            plot_durations()
-            break
+                episode_durations.append(t + 1)
+                # 如果当前 episode 有记录 loss，则计算平均 loss，否则记录为 None
+                if episode_loss_values:
+                    avg_loss = sum(episode_loss_values) / len(episode_loss_values)
+                else:
+                    avg_loss = None
+                episode_losses.append(avg_loss)
+                # 输出日志信息：episode编号、持续时间以及平均loss
+                print(f"Episode {i_episode + 1}: Duration = {t + 1}, Average Loss = {avg_loss}")
+                plot_durations()
+                break
 
 print("Complete")
 plot_durations(show_result=True)
@@ -311,9 +295,11 @@ plt.show()
 plt.savefig(os.path.join(save_dir, "ActorCritic_cartpole.png"))
 
 # 保存训练好的模型
-model_path = os.path.join(save_dir, "ActorCritic_cartpole.pth")
-torch.save(actor_critic.state_dict(), model_path)
-print(f"Model saved as {model_path}")
+actor_path = os.path.join(save_dir, "Actor_cartpole.pth")
+critic_path = os.path.join(save_dir, "Critic_cartpole.pth")
+torch.save(actor.state_dict(), actor_path)
+torch.save(critic.state_dict(), critic_path)
+print(f"Models saved as {actor_path} and {critic_path}")
 
 # ----------------- 模型加载并生成视频演示 -----------------
 # 创建新环境用于录制视频，这里使用 gymnasium 提供的 RecordVideo 封装器
@@ -331,8 +317,10 @@ video_env = RecordVideo(
 )
 
 # 加载保存的模型
-actor_critic.load_state_dict(torch.load(model_path, map_location=device))
-actor_critic.eval()
+actor.load_state_dict(torch.load(actor_path, map_location=device))
+critic.load_state_dict(torch.load(critic_path, map_location=device))
+actor.eval()
+critic.eval()
 
 # 初始化环境并开始录制视频
 state, info = video_env.reset()
@@ -342,7 +330,8 @@ done = False
 while not done:
     # 根据当前状态选择动作（贪婪策略）
     with torch.no_grad():
-        action = actor_critic(state)[0].max(1).indices.view(1, 1)
+        prob = actor(state)
+        action = prob.max(1).indices.view(1, 1)
     observation, reward, terminated, truncated, _ = video_env.step(action.item())
     done = terminated or truncated
     state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
