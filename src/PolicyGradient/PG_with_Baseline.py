@@ -57,39 +57,6 @@ class ReplayMemory(object):
         self.memory.clear()
 
 
-# 3. Establish the Dueling DQN model
-# class PG_BS_Reinforce(nn.Module):
-#     def __init__(self, n_observations, n_actions):
-#         super(PG_BS_Reinforce, self).__init__()
-
-#         # Shared layers
-#         self.layer1 = nn.Linear(n_observations, 128)
-#         self.layer2 = nn.Linear(128, 128)
-
-#         # Prob stream (P(a|s))
-#         self.prob_stream = nn.Linear(128, n_actions)
-#         self.softmax = nn.Softmax(dim=1)
-
-#     def forward(self, x):
-#         x = F.relu(self.layer1(x))
-#         x = F.relu(self.layer2(x))
-
-#         return self.softmax(self.prob_stream(x))
-
-
-# class Value_Net(nn.Module):
-#     def __init__(self, n_observations):
-#         super(Value_Net, self).__init__()
-#         self.layer1 = nn.Linear(n_observations, 128)
-#         self.layer2 = nn.Linear(128, 128)
-#         self.value_stream = nn.Linear(128, 1)
-
-#     def forward(self, x):
-#         x = F.relu(self.layer1(x))
-#         x = F.relu(self.layer2(x))
-#         return self.value_stream(x)
-
-
 class ActorCritic(nn.Module):
     """共享两层 MLP 的 Actor‑Critic 网络。"""
 
@@ -138,20 +105,8 @@ steps_done = 0
 
 def select_action(state):
     global steps_done
-    # sample = random.random()
-    # eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1.0 * steps_done / EPS_DECAY)
     steps_done += 1
-    # if sample > eps_threshold:
-    #     with torch.no_grad():
-    #         # t.max(1) will return the largest column value of each row.
-    #         # second column on max result is index of where max element was
-    #         # found, so we pick action with the larger expected reward.
-    #         return policy_net(state).max(1).indices.view(1, 1)
-    # else:
-    #     return torch.tensor([[env.action_space.sample()]], device=device, dtype=torch.long)
     prob, _ = actor_critic(state)
-    # log_prob = torch.log(prob)
-    # action = torch.multinomial(prob, num_samples=1)
     dist = torch.distributions.Categorical(probs=prob)
     entropy = dist.entropy()
     action = dist.sample()
