@@ -17,9 +17,21 @@ from gymnasium.wrappers import RecordVideo
 import time
 import numpy as np
 
+# Set random seed for reproducibility
+SEED = 3
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 # 1. Initialize the environment
 env = gym.make("CartPole-v1")
+env.reset(seed=SEED)
+env.action_space.seed(SEED)
 
 # set up matplotlib
 is_ipython = "inline" in matplotlib.get_backend()
@@ -30,15 +42,7 @@ plt.ion()
 # if GPU is to be used
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
-# Set random seed for reproducibility
-SEED = 1
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+
 
 class RolloutBuffer:
     def __init__(self):
@@ -216,7 +220,7 @@ def test_model(num_test_episodes=3):
     test_durations_local = []
     
     for _ in range(num_test_episodes):
-        state, info = env.reset()
+        state, info = env.reset(seed=SEED)  # Add seed for reproducibility
         state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         
         for t in count():
@@ -528,7 +532,7 @@ for i_episode in tqdm(range(TOTAL_TIMESTEPS//ROLLOUT_STEPS)):
     episode_returns, episode_lengths = [], []
     episode_return, episode_length = 0, 0
     # Initialize the environment and get its state
-    state, info = env.reset()
+    state, info = env.reset(seed=SEED)  # Add seed for reproducibility in training loop
     state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
     episode_loss_values = []  # 记录当前 episode 内所有优化步骤的loss
     buffer.clear()
@@ -556,7 +560,7 @@ for i_episode in tqdm(range(TOTAL_TIMESTEPS//ROLLOUT_STEPS)):
         episode_length += 1
 
         if done:
-            state, _ = env.reset()
+            state, _ = env.reset(seed=SEED)  # Add seed for each reset during training
             state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
             episode_returns.append(episode_return)
             episode_lengths.append(episode_length)
@@ -705,7 +709,7 @@ actor.eval()
 critic.eval()
 
 # 初始化环境并开始录制视频
-state, info = video_env.reset()
+state, info = video_env.reset(seed=SEED)  # Add seed for video demonstration
 state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
 done = False
 
