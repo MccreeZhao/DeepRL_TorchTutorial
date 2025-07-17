@@ -19,7 +19,16 @@ import numpy as np
 
 
 # 1. Initialize the environment
-env = gym.make("CartPole-v1")
+# env = gym.make("CartPole-v1")
+def make_env(seed):
+    def _thunk():
+        e = gym.make("CartPole-v1")
+        e.reset(seed=seed)
+        return e
+    return _thunk
+
+num_envs = 8
+env = gym.vector.SyncVectorEnv([make_env(i) for i in range(num_envs)])
 
 # set up matplotlib
 is_ipython = "inline" in matplotlib.get_backend()
@@ -50,20 +59,20 @@ class RolloutBuffer:
     def compute_returns_advantages(self, next_value, gamma=0.99, lam=0.95):
         """GAE‑λ; returns tensor advantages normalized, returns."""
         values = self.values + [next_value]
-        gae = 0
         advantages = []
+        gae = torch.zeros((num_envs,), dtype=torch.float32, device=device)
         for step in reversed(range(len(self.rewards))):
-            delta = self.rewards[step] + gamma * values[step+1] * (1 - self.dones[step]) - values[step]
-            gae = delta + gamma * lam * (1 - self.dones[step]) * gae
+            delta = self.rewards[step] + gamma * values[step+1] * (1 - self.dones[step].float()) - values[step]
+            gae = delta + gamma * lam * (1 - self.dones[step].float()) * gae
             advantages.insert(0, gae)
         returns = [adv + v for adv, v in zip(advantages, self.values)]
         # to tensors
-        self.observations = torch.stack(self.observations, dim=0).to(device).squeeze(1)
-        self.actions = torch.tensor(self.actions).to(device)
-        self.logprobs = torch.stack(self.logprobs).detach() # 在PPO里，保留old_policy的log_prob用来算clip ratio,不用这个做policy优化
-        self.advantages = torch.tensor(advantages, dtype=torch.float32, device=device)
-        self.returns = torch.tensor(returns, dtype=torch.float32, device=device)
-        self.values = torch.tensor(self.values, dtype=torch.float32, device=device)
+        self.observations = torch.cat(self.observations, dim=0).to(device)
+        self.actions = torch.cat(self.actions, dim=0).to(device)
+        self.logprobs = torch.cat(self.logprobs, dim=0).detach()
+        self.advantages = torch.cat(advantages, dim=0).flatten().to(dtype=torch.float32, device=device)
+        self.returns = torch.cat(returns, dim=0).flatten().to(dtype=torch.float32, device=device)
+        self.values = torch.cat(self.values, dim=0).flatten().to(dtype=torch.float32, device=device)
 
         # Normalize advantages
         self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
@@ -172,10 +181,10 @@ def get_entropy_coef(current_epoch, total_epochs=TOTAL_EPOCHS,
 
 
 # Get number of actions from gym action space
-n_actions = env.action_space.n
+n_actions = env.single_action_space.n
 # Get the number of state observations
 state, info = env.reset()
-n_observations = len(state)
+n_observations = env.single_observation_space.shape[0]
 
 # actor = Actor(n_observations, n_actions).to(device)
 # critic = Critic(n_observations).to(device)
@@ -196,9 +205,8 @@ def select_action(state):
     dist = torch.distributions.Categorical(logits=logits)
     entropy = dist.entropy()
     action = dist.sample()
-    # action = logits.argmax(dim=1)
-    log_prob = dist.log_prob(action)  # better than torch.log() ?
-    return action.item(), log_prob, entropy, value  # [1]
+    log_prob = dist.log_prob(action)
+    return action, log_prob, entropy, value
 
 
 def test_model(num_test_episodes=3):
@@ -206,8 +214,10 @@ def test_model(num_test_episodes=3):
     actor.eval()  # 设置为评估模式
     test_durations_local = []
     
+    test_env = gym.make("CartPole-v1")
+    
     for _ in range(num_test_episodes):
-        state, info = env.reset()
+        state, info = test_env.reset()
         state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         
         for t in count():
@@ -216,7 +226,7 @@ def test_model(num_test_episodes=3):
                 prob = actor(state)
                 action = prob.argmax(dim=1).item()
             
-            observation, reward, terminated, truncated, _ = env.step(action)
+            observation, reward, terminated, truncated, _ = test_env.step(action)
             done = terminated or truncated
             
             if done:
@@ -225,6 +235,7 @@ def test_model(num_test_episodes=3):
                 
             state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
     
+    test_env.close()
     actor.train()  # 恢复训练模式
     return sum(test_durations_local) / len(test_durations_local)  # 返回平均持续时间
 
@@ -495,7 +506,7 @@ def optimize_model(i_episode, buffer, entropy_coef):
 
 
 # 创建保存文件夹
-save_dir = "save/PPO"
+save_dir = "save/PPO_parallel"
 os.makedirs(save_dir, exist_ok=True)
 
 # 打印训练配置信息
@@ -517,45 +528,52 @@ global_step = 0
 
 for i_episode in tqdm(range(TOTAL_TIMESTEPS//ROLLOUT_STEPS)):
     episode_returns, episode_lengths = [], []
-    episode_return, episode_length = 0, 0
+    episode_return = np.zeros(num_envs)
+    episode_length = np.zeros(num_envs)
     # Initialize the environment and get its state
     state, info = env.reset()
-    state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+    state = torch.tensor(state, dtype=torch.float32, device=device)
     episode_loss_values = []  # 记录当前 episode 内所有优化步骤的loss
     buffer.clear()
 
-    for rollout_step in range(ROLLOUT_STEPS):
-        global_step += 1
+    for rollout_step in range(ROLLOUT_STEPS // num_envs):
+        global_step += num_envs
         action, log_prob, entropy, value = select_action(state)
-        observation, reward, terminated, truncated, _ = env.step(action)
+        observation, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
         
         # Reward Shaping
-        if np.abs(observation[0]) < 0.1:
-            reward = reward  # 中心区域无惩罚
-        else:
-            velocity_penalty = np.abs(observation[1]) * 0.02 
-            reward = reward - (np.abs(observation[0]) - 0.1) * 0.2 - velocity_penalty
+        position = np.abs(observation[:, 0])
+        velocity = np.abs(observation[:, 1])
+        penalty = np.where(position < 0.1, 0, (position - 0.1) * 0.2 + velocity * 0.02)
+        reward -= penalty
         
-        done = terminated or truncated
+        done = np.logical_or(terminated, truncated)
 
-        buffer.store(state, action, log_prob, reward, done, value.item())
+        buffer.store(state, action, log_prob, torch.tensor(reward, dtype=torch.float32, device=device), torch.tensor(done, dtype=torch.bool, device=device), value.squeeze(-1))
 
-        next_state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
+        next_state = torch.tensor(observation, dtype=torch.float32, device=device)
+
+        # Handle resets
+        reset_ids = np.where(done)[0]
+        for idx in reset_ids:
+            obs, _ = env.envs[idx].reset()
+            next_state[idx] = torch.tensor(obs, dtype=torch.float32, device=device)
+
         state = next_state
 
         episode_return += reward
         episode_length += 1
 
-        if done:
-            state, _ = env.reset()
-            state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            episode_returns.append(episode_return)
-            episode_lengths.append(episode_length)
-            print("episode_length: ", episode_length)
-            episode_durations.append(episode_length)
-            episode_return, episode_length = 0, 0
+        if len(reset_ids) > 0:
+            for idx in reset_ids:
+                episode_returns.append(episode_return[idx])
+                episode_lengths.append(episode_length[idx])
+                print(f"Env {idx} episode_length: {episode_length[idx]}")
+                episode_durations.append(episode_length[idx])
+                episode_return[idx] = 0
+                episode_length[idx] = 0
     with torch.no_grad():
-        next_value = critic(next_state).detach()
+        next_value = critic(state).squeeze(-1).detach()
     buffer.compute_returns_advantages(next_value, GAMMA, LAMBDA)
 
     # 计算当前epoch的entropy coefficient
@@ -681,7 +699,7 @@ print(f"Models saved as {actor_path} and {critic_path}")
 video_env = gym.make("CartPole-v1", render_mode="rgb_array")
 # RecordVideo 会自动保存视频到指定目录
 current_time = time.strftime("%Y%m%d_%H%M%S")
-video_name = f"cartpole_PPO_{current_time}{filename_suffix}"
+video_name = f"cartpole_PPO_parallel_{current_time}{filename_suffix}"
 video_env = RecordVideo(
     video_env, 
     video_folder=save_dir,
@@ -704,8 +722,8 @@ while not done:
     # 根据当前状态选择动作（贪婪策略）
     with torch.no_grad():
         logits = actor(state)
-        action = logits.max(1).indices.view(1, 1)
-    observation, reward, terminated, truncated, _ = video_env.step(action.item())
+        action = logits.argmax(dim=-1).item()
+    observation, reward, terminated, truncated, _ = video_env.step(action)
     done = terminated or truncated
     state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
 
